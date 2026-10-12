@@ -533,8 +533,12 @@ pub(crate) fn run_doc(
             source: source.to_string(),
         })
         .collect();
+    // The executor computed these - a partition window, a sequence slice's
+    // source URI - so they go through the system variant: the quote-breakout
+    // refusal still applies, but a URI that legitimately carries a parenthesis
+    // is not treated as an operator authoring SQL.
     let (recorded, sources) =
-        crate::context::apply_params_from(&mut doc, &supplied)
+        crate::context::apply_params_from_system(&mut doc, &supplied)
             .map_err(|e| (None, e))?;
     resolve_slice_doc(&mut doc, workspace, resolve).map_err(|e| (None, e))?;
 

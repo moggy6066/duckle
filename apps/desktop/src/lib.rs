@@ -1199,7 +1199,7 @@ fn workspace_catalog_inspect(workspace: String, asset: String) -> Result<Vec<Str
 #[tauri::command]
 fn engine_status(app: tauri::AppHandle) -> Result<Vec<EngineStatus>, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(engine_manager::status(&dir))
+    Ok(engine_manager::status(&dir, std::env::var_os("DUCKLE_DUCKDB_BIN")))
 }
 
 /// The chat models offered at install time, smallest first, for the setup

@@ -6665,6 +6665,61 @@ mod tests {
         assert!(!console_auth::Role::Viewer.allows(write), "a viewer must not start a backfill");
     }
 
+    /// The backfill and batch routes take an id from the request, and both
+    /// stores joined it onto their folder as given. `../` in it let a viewer
+    /// read a plan or a batch ledger from anywhere the server could reach, and
+    /// let an operator's cancel or redrive write one back there.
+    #[test]
+    fn a_console_id_cannot_reach_a_file_outside_its_store() {
+        use duckle_duckdb_engine::backfill;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (ws, outside) = (root.join("ws"), root.join("outside"));
+        for d in [ws.join("pipelines"), backfill::dir(&ws), duckle_duckdb_engine::batch::batches_dir(&ws), outside.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            ws.join("pipelines/daily.json"),
+            r#"{"formatVersion":1,"name":"daily","partition":{"type":"time","cadence":"day","timezone":"UTC"},"nodes":[],"edges":[]}"#,
+        )
+        .unwrap();
+        let mut plan =
+            duckle_duckdb_engine::backfill_exec::plan_for(&ws, &ws.join("pipelines/daily.json"), "2020-01-01", "2020-01-02", 4, None)
+                .unwrap();
+        plan.id = "../../../outside/plan".into();
+        let planted = serde_json::to_string(&plan).unwrap();
+        std::fs::write(outside.join("plan.json"), &planted).unwrap();
+        let ledger = "{\"v\":1,\"index\":0,\"status\":\"error\",\"at\":\"2026-08-27T10:00:00Z\",\"worker\":\"w\",\"error\":\"boom\"}\n";
+        std::fs::write(outside.join("b.ledger.ndjson"), ledger).unwrap();
+
+        let state = guarded_state(&ws);
+        let call = |method: &str, path: &str, id: &str, body: serde_json::Value| {
+            let mut req = request(method, path, Some("Bearer s3cret"));
+            if method == "GET" {
+                req.query.insert("id".into(), id.into());
+            }
+            req.body = serde_json::to_vec(&body).unwrap();
+            let reply = route_console(&req, &state);
+            (reply.code(), String::from_utf8_lossy(&reply.body).into_owned())
+        };
+        let (code, body) = call("GET", "/api/backfills", "../../../outside/plan", serde_json::Value::Null);
+        assert!(code != 200 && !body.contains("2020-01-01"), "read a plan outside the workspace: {code} {body}");
+        for action in ["cancel", "retry"] {
+            let (code, body) =
+                call("POST", "/api/backfills", "", serde_json::json!({ "action": action, "id": "../../../outside/plan" }));
+            assert_ne!(code, 200, "{action} took a plan outside the workspace: {body}");
+        }
+        let (_, body) = call("GET", "/api/batch", "../../outside/b", serde_json::Value::Null);
+        assert!(!body.contains("boom"), "read a ledger outside the workspace: {body}");
+        call("POST", "/api/batch/redrive", "", serde_json::json!({ "id": "../../outside/b" }));
+
+        assert_eq!(std::fs::read_to_string(outside.join("plan.json")).unwrap(), planted);
+        assert_eq!(std::fs::read_to_string(outside.join("b.ledger.ndjson")).unwrap(), ledger);
+        let (code, body) = call("GET", "/api/backfills", "bf-missing-1", serde_json::Value::Null);
+        let name = root.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(code == 404 && !body.contains(&name), "a missing plan named the server's path: {body}");
+    }
+
     /// #314: the web editor gets the same analysis shape the desktop does.
     ///
     /// One object for one node, using the upstream columns the EDITOR resolved

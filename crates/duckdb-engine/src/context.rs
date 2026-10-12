@@ -431,15 +431,36 @@ const SHELL_METACHARACTERS: [char; 13] = [
     ';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r', '{', '}',
 ];
 
-/// Sequences that end one SQL token and begin something else.
+/// Sequences that let a value break OUT of a quote it was substituted into.
 ///
 /// The same judgement [`SHELL_METACHARACTERS`] makes, for the same reason: a
 /// parameter is meant to be a VALUE, and escaping correctly needs the quoting
 /// context, which text substitution into an arbitrary property does not have.
 /// A quote closes a literal, a double quote closes an identifier, a semicolon
-/// ends the statement, and `--` or `/*` comment out whatever was going to
-/// follow the value.
-const SQL_METACHARACTERS: [&str; 5] = ["'", "\"", ";", "--", "/*"];
+/// ends the statement, and `--` or `/*` comment out what was going to follow.
+///
+/// Refused for EVERY supplied value whatever produced it: a value that can
+/// close the quote around it can append a statement nobody authored, and that
+/// is true of a computed value as much as an operator's.
+const SQL_BREAKOUT: [&str; 5] = ["'", "\"", ";", "--", "/*"];
+
+/// Sequences that let a value BE a SQL expression where the author interpolated
+/// it without a quote around it (`SELECT ${x} FROM t`): a parenthesis opens a
+/// function call or a subquery - the step that reaches DuckDB's file-reading
+/// functions - and `|` is the `||` that assembles a string from pieces, which
+/// is how a per-character check gets walked around.
+///
+/// Refused only for OPERATOR-supplied run input, which is what the privilege
+/// boundary is about (running needs Operator, authoring SQL needs Admin) and
+/// where an author's `enum`/`pattern` is the opt-in. NOT applied to a value the
+/// executor itself computes - a partition window, or a source-object URI that
+/// may legitimately contain a parenthesis - which no operator authored and for
+/// which there is no opt-in to reach for. This does not make every unquoted
+/// interpolation safe: a value of bare keywords and spaces can still express
+/// logic over the data the query already reaches. It removes the escalation to
+/// arbitrary functions and subqueries; the complete answer for an unquoted
+/// position is the author declaring an `enum`/`pattern`.
+const SQL_EXPRESSION: [&str; 3] = ["(", ")", "|"];
 
 /// May this parameter's value carry that syntax?
 ///
@@ -562,16 +583,44 @@ pub fn apply_params(
     Ok(apply_params_from(doc, &supplied)?.0)
 }
 
-/// #317: substitute, knowing where each value came from.
+/// #317: substitute operator-supplied run input, knowing where each value came
+/// from.
 ///
 /// Returns the redacted map for history AND what each parameter displaced.
 /// Louis's case: a schedule binds `jurisdiction = BE` and the run that starts
 /// supplies `NL`. Last-write-wins is a fine RULE - what is not fine is that the
 /// result cannot afterwards be told apart from someone binding the same name
 /// twice by accident. Sources are given lowest-authority first.
+///
+/// The values here are supplied by whoever started the run - the dashboard
+/// form, the CLI, a schedule, a plan step - so they are held to the full value
+/// rule, [`SQL_EXPRESSION`] included.
 pub fn apply_params_from(
     doc: &mut PipelineDoc,
     supplied: &[crate::params::Supplied],
+) -> Result<(std::collections::BTreeMap<String, String>, Vec<crate::params::Effective>), String> {
+    apply_params_from_impl(doc, supplied, true)
+}
+
+/// Substitute values the EXECUTOR computed - a backfill's partition window, a
+/// sequence slice's source URI - rather than ones an operator supplied.
+///
+/// Same boundary and the same quote-breakout refusal, but not the
+/// [`SQL_EXPRESSION`] rule: these values are not an operator authoring SQL (the
+/// privilege the rule guards), and one of them is a source-object URI that may
+/// legitimately carry a parenthesis, with no `enum`/`pattern` opt-in to reach
+/// for because the operator never typed it.
+pub fn apply_params_from_system(
+    doc: &mut PipelineDoc,
+    supplied: &[crate::params::Supplied],
+) -> Result<(std::collections::BTreeMap<String, String>, Vec<crate::params::Effective>), String> {
+    apply_params_from_impl(doc, supplied, false)
+}
+
+fn apply_params_from_impl(
+    doc: &mut PipelineDoc,
+    supplied: &[crate::params::Supplied],
+    check_expression: bool,
 ) -> Result<(std::collections::BTreeMap<String, String>, Vec<crate::params::Effective>), String> {
     let params: HashMap<String, String> =
         crate::params::merge(supplied).0.into_iter().collect();
@@ -655,13 +704,22 @@ pub fn apply_params_from(
         if value.contains(SHELL_METACHARACTERS) && used_in_executed_prop(doc, name) {
             continue;
         }
-        if let Some(found) = SQL_METACHARACTERS.iter().find(|m| value.contains(**m)) {
+        // Breakout is refused whatever supplied the value; expression syntax
+        // only for operator run input (see the two consts).
+        let found = SQL_BREAKOUT.iter().find(|m| value.contains(**m)).or_else(|| {
+            if check_expression {
+                SQL_EXPRESSION.iter().find(|m| value.contains(**m))
+            } else {
+                None
+            }
+        });
+        if let Some(found) = found {
             return Err(format!(
-                "parameter '{name}' contains {found:?}, which can end one SQL token and begin \
-                 another, so it is refused. A run parameter is a value. If this parameter really \
-                 does carry that character, declare it in the pipeline's `parameters` with an \
-                 `enum` or a `pattern` that says so - that is a decision for whoever authors the \
-                 pipeline."
+                "parameter '{name}' contains {found:?}, which lets the value act as SQL rather \
+                 than as data, so it is refused. A run parameter is a value. If this parameter \
+                 really does carry that character, declare it in the pipeline's `parameters` with \
+                 an `enum` or a `pattern` that says so - that is a decision for whoever authors \
+                 the pipeline."
             ));
         }
     }
@@ -1908,6 +1966,69 @@ mod run_parameters_are_values {
     fn a_comment_marker_is_refused_too() {
         let mut doc = doc_with("SELECT * FROM t WHERE dt > '${since}'", serde_json::json!({}));
         assert!(run(&mut doc, "since", "1970-01-01' OR 1=1 -- ").is_err());
+    }
+
+    /// GHSA-fhqx-3p6q-66p4: the quote/comment/semicolon refusal assumes a
+    /// parameter can only do harm by breaking OUT of a surrounding quote. But
+    /// an author may interpolate `${x}` in an unquoted position - `SELECT ${x}
+    /// FROM t` - and there the value needs no quote to be code: it already is
+    /// an expression. A function call from that position reaches DuckDB's
+    /// file-reading functions, so a value carrying call syntax is not a value.
+    #[test]
+    fn an_undeclared_parameter_cannot_carry_a_function_call() {
+        let mut doc = doc_with("SELECT ${cols} FROM t", serde_json::json!({}));
+        let err = run(&mut doc, "cols", "version()")
+            .expect_err("a function call is expression syntax, not a value");
+        assert!(err.contains("cols"), "the refusal has to name the parameter: {err}");
+        assert_eq!(sql_of(&doc), "SELECT ${cols} FROM t", "a refused value must not half-substitute");
+    }
+
+    /// `||` assembles a string from pieces that each pass a per-character
+    /// check, which is how a blacklist of literal characters is walked around.
+    /// It is expression syntax for the same reason a call is.
+    #[test]
+    fn an_undeclared_parameter_cannot_concatenate() {
+        let mut doc = doc_with("SELECT ${cols} FROM t", serde_json::json!({}));
+        assert!(
+            run(&mut doc, "cols", "a || b").is_err(),
+            "concatenation builds a value out of pieces and must be refused"
+        );
+    }
+
+    /// The opt-in governs the new syntax too: an author who writes a pattern
+    /// that permits parentheses has made that decision, and authoring is Admin.
+    #[test]
+    fn an_author_can_permit_a_function_call_by_declaring_a_pattern() {
+        let mut doc = doc_with(
+            "SELECT ${expr} FROM t",
+            serde_json::json!({ "expr": { "type": "string", "pattern": "^[a-z_]+\\([0-9]*\\)$" } }),
+        );
+        run(&mut doc, "expr", "count()").expect("the author allowed this shape");
+        assert_eq!(sql_of(&doc), "SELECT count() FROM t");
+    }
+
+    /// A value the executor computes - here a sequence slice's source URI - is
+    /// not an operator authoring SQL, so the expression rule does not reach it:
+    /// a file whose name contains a parenthesis must still back-fill. The
+    /// quote-breakout rule still applies to it, because a computed value that
+    /// closes its quote is as dangerous as an operator's.
+    #[test]
+    fn a_system_computed_value_may_contain_a_parenthesis_but_not_break_out() {
+        let sql = "SELECT * FROM read_parquet('${sequence_object}')";
+        let system = |value: &str| {
+            let mut doc = doc_with(sql, serde_json::json!({}));
+            let supplied = vec![crate::params::Supplied {
+                name: "sequence_object".to_string(),
+                value: value.to_string(),
+                source: "partition".to_string(),
+            }];
+            super::apply_params_from_system(&mut doc, &supplied).map(|_| sql_of(&doc))
+        };
+        assert_eq!(
+            system("s3://bucket/report (final).parquet").expect("a computed URI is not operator SQL"),
+            "SELECT * FROM read_parquet('s3://bucket/report (final).parquet')"
+        );
+        assert!(system("x') SELECT 1 FROM t WHERE ('1'='1").is_err(), "a quote breakout is refused whatever supplied it");
     }
 
     /// An ordinary value still substitutes. The point is that a parameter is a

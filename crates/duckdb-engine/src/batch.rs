@@ -110,7 +110,9 @@ pub fn batches_dir(workspace: &Path) -> PathBuf {
 }
 
 pub fn batch_path(workspace: &Path, batch_id: &str) -> PathBuf {
-    batches_dir(workspace).join(format!("{batch_id}.ndjson"))
+    // The console hands an id in from a request, so it is reduced to one file
+    // name. Every id `new_batch_id` makes comes through unchanged.
+    batches_dir(workspace).join(format!("{}.ndjson", crate::connectors::sanitize_path_segment(batch_id)))
 }
 
 /// A batch id that is unique per dispatch and still says what it came from.
@@ -137,7 +139,7 @@ pub fn write(workspace: &Path, batch_id: &str, items: &[WorkItem]) -> Result<Pat
         EngineError::Config(format!("batch: cannot create {}: {}", dir.display(), e))
     })?;
     let final_path = batch_path(workspace, batch_id);
-    let tmp = dir.join(format!("{batch_id}.{}.ndjson.tmp", std::process::id()));
+    let tmp = final_path.with_extension(format!("{}.ndjson.tmp", std::process::id()));
 
     let mut out = String::new();
     for item in items {
@@ -204,7 +206,7 @@ pub struct LedgerLine {
 }
 
 pub fn ledger_path(workspace: &Path, batch_id: &str) -> PathBuf {
-    batches_dir(workspace).join(format!("{batch_id}.ledger.ndjson"))
+    batches_dir(workspace).join(format!("{}.ledger.ndjson", crate::connectors::sanitize_path_segment(batch_id)))
 }
 
 /// Every readable ledger line for a batch, oldest first.
@@ -1000,6 +1002,35 @@ mod tests {
         let st = item_state(&it, &lines, t("2026-08-27T10:06:00Z"));
         assert_eq!(st.phase, Phase::Done);
         assert_eq!(st.next_attempt_at, None, "nothing is waiting for a done item");
+    }
+
+    /// A batch id names two files, and the console takes one from a viewer's
+    /// request. Joined as given, `../` in it read, and let a redrive rewrite,
+    /// NDJSON files anywhere the process could reach.
+    #[test]
+    fn a_batch_id_cannot_reach_a_file_outside_the_batch_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, outside) = (tmp.path().join("ws"), tmp.path().join("outside"));
+        std::fs::create_dir_all(batches_dir(&ws)).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let escaping = "../../outside/b";
+        let items = format!("{}\n", serde_json::to_string(&item(0, "orders")).unwrap());
+        let failed = attempt(0, "error", "2026-08-27T10:00:00Z", Some("boom"));
+        let ledger_text = format!("{}\n", serde_json::to_string(&failed).unwrap());
+        std::fs::write(outside.join("b.ndjson"), &items).unwrap();
+        std::fs::write(outside.join("b.ledger.ndjson"), &ledger_text).unwrap();
+
+        let st = status(&ws, escaping);
+        assert_eq!((st.items, st.failed), (0, 0), "read a batch from outside the folder");
+        assert!(ledger(&ws, escaping).is_empty(), "read a ledger from outside the folder");
+        let _ = redrive(&ws, escaping);
+        assert_eq!(std::fs::read_to_string(outside.join("b.ledger.ndjson")).unwrap(), ledger_text);
+        // A temp file written outside would be renamed away before anyone looked,
+        // so something stands where it would go: aimed there, the write fails.
+        std::fs::create_dir(outside.join(format!("b.{}.ndjson.tmp", std::process::id()))).unwrap();
+        write(&ws, escaping, &[item(1, "customers")]).unwrap();
+        assert_eq!(std::fs::read_to_string(outside.join("b.ndjson")).unwrap(), items);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 3, "wrote beside the files outside");
     }
 
 }

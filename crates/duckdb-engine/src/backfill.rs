@@ -464,7 +464,10 @@ pub fn dir(workspace: &Path) -> PathBuf {
 }
 
 pub fn path_for(workspace: &Path, id: &str) -> PathBuf {
-    dir(workspace).join(format!("{id}.json"))
+    // The console, MCP and the CLI all hand an id in from outside, so it is
+    // reduced to one file name here, as a run receipt's is. Every id `new_id`
+    // makes comes through unchanged, and `../` cannot leave the folder.
+    dir(workspace).join(format!("{}.json", crate::connectors::sanitize_path_segment(id)))
 }
 
 pub fn new_id(pipeline: &str) -> String {
@@ -488,9 +491,11 @@ pub fn save(workspace: &Path, backfill: &Backfill) -> Result<(), String> {
     let dir = dir(workspace);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let body = serde_json::to_string_pretty(backfill).map_err(|e| e.to_string())?;
-    let tmp = dir.join(format!(".{}.tmp", backfill.id));
+    // Named after the final path, so the id becomes a file name in one place.
+    let path = path_for(workspace, &backfill.id);
+    let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, body).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path_for(workspace, &backfill.id)).map_err(|e| e.to_string())
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 /// Apply a change to the plan ON DISK, under the store lock.
@@ -518,9 +523,10 @@ pub fn update<T>(
 }
 
 pub fn load(workspace: &Path, id: &str) -> Result<Backfill, String> {
-    let path = path_for(workspace, id);
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    // Named by its id: the console returns this to whoever asked, and a path
+    // would tell them where the server keeps its files.
+    let text = std::fs::read_to_string(path_for(workspace, id)).map_err(|e| format!("backfill {id}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("backfill {id}: {e}"))
 }
 
 pub fn list(workspace: &Path) -> Vec<Backfill> {
@@ -1010,6 +1016,34 @@ mod tests {
             b.recheck_artifacts(true).is_empty(),
             "a partition slice was reset for not having a chunk's artifact"
         );
+    }
+
+    /// A plan's id names its file, and the console, MCP and the CLI all take
+    /// one from outside. Joined as given, `../` in it read and rewrote JSON
+    /// files anywhere the process could reach, and a failed read answered with
+    /// the absolute path it had tried.
+    #[test]
+    fn a_plan_id_cannot_reach_a_file_outside_the_backfill_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, outside) = (tmp.path().join("ws"), tmp.path().join("outside"));
+        std::fs::create_dir_all(dir(&ws)).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let escaping = "../../../outside/plan";
+        let mut planted = plan(("2020-01-01", "2020-01-02"));
+        planted.id = escaping.into();
+        let text = serde_json::to_string(&planted).unwrap();
+        std::fs::write(outside.join("plan.json"), &text).unwrap();
+
+        assert!(load(&ws, escaping).is_err(), "read a plan from outside the folder");
+        assert!(update(&ws, escaping, |p| p.cancel()).is_err(), "changed a plan outside the folder");
+        // A plan that carries such an id is still written inside the folder.
+        save(&ws, &planted).unwrap();
+        assert_eq!(std::fs::read_to_string(outside.join("plan.json")).unwrap(), text);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "wrote beside the file outside");
+
+        let missing = load(&ws, "bf-missing-1").unwrap_err();
+        let root = tmp.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert!(!missing.contains(&root), "a failed read named the server's path: {missing}");
     }
 
 }

@@ -646,10 +646,49 @@ fn install_duckdb_extensions<F: FnMut(InstallProgress)>(bin: &Path, on_progress:
     }
 }
 
-pub fn status(app_data: &Path) -> Vec<EngineStatus> {
+/// DuckDB's status when `DUCKLE_DUCKDB_BIN` points at a usable binary.
+///
+/// #373: the desktop runs whatever `resolve_duckdb_bin` returns, and an
+/// externally-set `DUCKLE_DUCKDB_BIN` wins there (#179). First-run setup asked
+/// the engine store instead, which knows nothing about the override, so it
+/// blocked on a download for a DuckDB the app would actually run. This mirrors
+/// `pick_duckdb_bin`'s precedence so the gate and the runtime agree.
+///
+/// The override is reported as installed and NEVER outdated: the user pointed
+/// Duckle at this binary, and the runtime uses it whatever its version, so
+/// offering to "upgrade" it by downloading over the bundled path - which the
+/// runtime would then ignore - would be a lie. A blank value, or a path to
+/// nothing, returns None so the normal engines-dir check still runs.
+fn duckdb_override_status(env_override: Option<&std::ffi::OsStr>) -> Option<EngineStatus> {
+    let path = env_override.filter(|v| !v.is_empty()).map(PathBuf::from)?;
+    if !path.exists() {
+        return None;
+    }
+    Some(EngineStatus {
+        id: DUCKDB.id.to_string(),
+        name: DUCKDB.name.to_string(),
+        description: DUCKDB.description.to_string(),
+        required: DUCKDB.required,
+        installed: true,
+        outdated: false,
+        version: probed_version(&path, &DUCKDB),
+        target_version: DUCKDB.version.to_string(),
+        path: Some(path.to_string_lossy().to_string()),
+        available: asset_for(&DUCKDB).is_some(),
+    })
+}
+
+pub fn status(app_data: &Path, duckdb_override: Option<std::ffi::OsString>) -> Vec<EngineStatus> {
     ENGINES
         .iter()
         .map(|s| {
+            // #373: an externally-provided DuckDB satisfies the required
+            // engine, since that is the one a run would use.
+            if s.id == DUCKDB.id {
+                if let Some(st) = duckdb_override_status(duckdb_override.as_deref()) {
+                    return st;
+                }
+            }
             let path = binary_path(app_data, s);
             let exists = path.exists();
             let on_disk = installed_version(app_data, s);
@@ -1419,7 +1458,7 @@ mod tests {
     #[test]
     fn status_lists_all_engines_missing_in_empty_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let st = status(tmp.path());
+        let st = status(tmp.path(), None);
         assert_eq!(st.len(), 3);
         let duck = st.iter().find(|e| e.id == "duckdb").unwrap();
         assert!(!duck.installed && duck.required && duck.available);
@@ -1441,12 +1480,47 @@ mod tests {
         std::fs::write(dir.join(binary_file_name(&DUCKDB)), b"old-binary").unwrap();
         std::fs::write(dir.join(".installed-version"), "0.0.1-old").unwrap();
 
-        let st = status(tmp.path());
+        let st = status(tmp.path(), None);
         let duck = st.iter().find(|e| e.id == "duckdb").unwrap();
         assert!(!duck.installed, "an old version must not read as installed");
         assert!(duck.outdated, "an old version must read as outdated");
         assert_eq!(duck.version.as_deref(), Some("0.0.1-old"));
         assert_eq!(duck.target_version, DUCKDB.version);
+    }
+
+    /// #373: when DUCKLE_DUCKDB_BIN points at a real binary the desktop runs
+    /// THAT (resolve_duckdb_bin / #179), so first-run setup must report DuckDB
+    /// satisfied rather than block on a download. The engines dir is empty
+    /// here; only the override makes it installed, and it is never outdated
+    /// because the user chose it and the runtime uses it whatever its version.
+    #[test]
+    fn an_override_binary_satisfies_duckdb_without_a_download() {
+        let tmp = tempfile::tempdir().unwrap(); // empty engines dir
+        let ext = tempfile::tempdir().unwrap();
+        let bin = ext.path().join(binary_file_name(&DUCKDB));
+        std::fs::write(&bin, b"stand-in duckdb").unwrap();
+
+        let st = status(tmp.path(), Some(bin.clone().into_os_string()));
+        let duck = st.iter().find(|e| e.id == "duckdb").unwrap();
+        assert!(duck.installed, "an override binary must satisfy the gate");
+        assert!(!duck.outdated, "the user pointed us here; do not offer to replace it");
+        assert_eq!(duck.path.as_deref(), Some(bin.to_string_lossy().as_ref()));
+    }
+
+    /// A blank value or a path to nothing is not an override: it falls through
+    /// to the normal engines-dir check rather than passing the gate falsely.
+    #[test]
+    fn a_blank_or_missing_override_does_not_satisfy_duckdb() {
+        let tmp = tempfile::tempdir().unwrap(); // empty engines dir
+        for ov in [
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from("/no/such/duckdb-xyz")),
+            None,
+        ] {
+            let st = status(tmp.path(), ov);
+            let duck = st.iter().find(|e| e.id == "duckdb").unwrap();
+            assert!(!duck.installed, "a blank or missing override must not pass the gate");
+        }
     }
 
     #[test]
@@ -1455,7 +1529,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = install(tmp.path(), "duckdb", None, |_| {}).expect("install");
         assert!(std::path::Path::new(&path).exists());
-        assert!(status(tmp.path())
+        assert!(status(tmp.path(), None)
             .iter()
             .any(|e| e.id == "duckdb" && e.installed));
     }
@@ -1471,7 +1545,7 @@ mod tests {
             std::fs::metadata(p).unwrap().len() > 0,
             "binary should be non-empty"
         );
-        assert!(status(tmp.path())
+        assert!(status(tmp.path(), None)
             .iter()
             .any(|e| e.id == "slothdb" && e.installed));
     }
